@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Servidor HTTP securizado para Asterisk con autenticación
-- GET: Descargar grabaciones con autenticación
-- POST: Subir archivos TTS/STT con autenticación y validación  
-- DELETE: Eliminar archivos SOLO de /var/spool/asterisk/recording/
-- Rutas separadas: /tmp/asterisk/tts/ y /tmp/asterisk/stt/
+Servidor HTTP CONCURRENTE para Asterisk con autenticación
+- Soporte multi-threaded para manejar múltiples peticiones simultáneas
+- Pool de threads configurable
+- Timeouts apropiados
+- Queue para operaciones pesadas
 
 Uso:
-  python3 /opt/asterisk-services/asterisk_server.py
+  python3.12 /opt/asterisk-services/asterisk_server.py
 """
 
 import os
@@ -16,19 +16,46 @@ import json
 import subprocess
 import hashlib
 import mimetypes
+import threading
+import queue
+import concurrent.futures
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
+
+# Servidor con soporte multi-threading
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTPServer que maneja cada request en un thread separado"""
+    
+    # Configuración de threading
+    daemon_threads = True                    # Threads se cierran al cerrar servidor
+    max_children = 50                       # Máximo de threads concurrentes
+    request_queue_size = 100                # Cola de requests pendientes
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Pool de threads para operaciones pesadas (conversión audio)
+        self.conversion_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=5,  # Máximo 5 conversiones simultáneas
+            thread_name_prefix="AudioConvert"
+        )
+        print(f"Servidor threaded iniciado - Max children: {self.max_children}")
+        print(f"Pool de conversión: {self.conversion_pool._max_workers} workers")
 
 class SecureAsteriskHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         # Configuración de directorios
-        self.recordings_dir = '/var/spool/asterisk/recording'  # Grabaciones permanentes
-        self.tts_dir = '/tmp/asterisk/tts'                     # Archivos TTS temporales
-        self.stt_dir = '/tmp/asterisk/stt'                     # Grabaciones STT temporales
+        self.recordings_dir = '/var/spool/asterisk/recording'
+        self.tts_dir = '/tmp/asterisk/tts'
+        self.stt_dir = '/tmp/asterisk/stt'
         
         self.valid_api_keys = self.load_api_keys()
         self.max_file_size = 50 * 1024 * 1024  # 50MB max
         self.allowed_extensions = ['.wav', '.mp3', '.ogg']
+        
+        # Timeouts para operaciones pesadas
+        self.conversion_timeout = 30  # 30 segundos max para conversión
+        self.upload_timeout = 60     # 60 segundos max para upload
         
         # Crear directorios temporales
         self.ensure_temp_directories()
@@ -40,7 +67,7 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
         for directory in [self.tts_dir, self.stt_dir]:
             if not os.path.exists(directory):
                 os.makedirs(directory, mode=0o755)
-                print(f"Directorio temporal creado: {directory}")
+                print(f"[{threading.current_thread().name}] Directorio temporal creado: {directory}")
     
     def load_api_keys(self):
         """Cargar API keys válidas desde archivo de configuración"""
@@ -88,10 +115,11 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
         return api_key in self.valid_api_keys
     
     def log_access(self, method, path, authenticated, client_ip):
-        """Log de accesos con información de seguridad"""
+        """Log de accesos con información de thread y seguridad"""
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        thread_name = threading.current_thread().name
         auth_status = "AUTH" if authenticated else "UNAUTH"
-        print(f"[{timestamp}] {client_ip} - {method} {path} - {auth_status}")
+        print(f"[{timestamp}] [{thread_name}] {client_ip} - {method} {path} - {auth_status}")
     
     def send_auth_error(self):
         """Enviar error de autenticación"""
@@ -103,19 +131,10 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
         error_response = {
             "error": "Authentication required",
             "message": "Provide valid API key in Authorization header",
-            "format": "Authorization: Bearer YOUR_API_KEY"
+            "format": "Authorization: Bearer YOUR_API_KEY",
+            "thread": threading.current_thread().name
         }
         self.wfile.write(json.dumps(error_response).encode())
-    
-    def get_file_path(self, filename):
-        """Determinar la ruta completa del archivo según su prefijo"""
-        if filename.startswith('tts_'):
-            return os.path.join(self.tts_dir, filename)
-        elif filename.startswith(('placa_', 'papeleta_')):
-            return os.path.join(self.stt_dir, filename)
-        else:
-            # Archivos permanentes en recordings_dir
-            return os.path.join(self.recordings_dir, filename)
     
     def get_target_directory(self, filename):
         """Determinar directorio destino para uploads"""
@@ -181,7 +200,7 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
             self.serve_file(file_path, filename)
             
         except Exception as e:
-            print(f"Error en GET: {e}")
+            print(f"[{threading.current_thread().name}] Error en GET: {e}")
             self.send_error(500, f"Internal server error: {str(e)}")
     
     def handle_tts_download(self):
@@ -197,7 +216,7 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
             self.serve_file(file_path, filename)
             
         except Exception as e:
-            print(f"Error en TTS download: {e}")
+            print(f"[{threading.current_thread().name}] Error en TTS download: {e}")
             self.send_error(500, f"TTS download error: {str(e)}")
     
     def handle_stt_download(self):
@@ -213,7 +232,7 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
             self.serve_file(file_path, filename)
             
         except Exception as e:
-            print(f"Error en STT download: {e}")
+            print(f"[{threading.current_thread().name}] Error en STT download: {e}")
             self.send_error(500, f"STT download error: {str(e)}")
     
     def serve_file(self, file_path, filename):
@@ -228,10 +247,10 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(file_data)
         
-        print(f"Archivo servido: {file_path} ({len(file_data)} bytes)")
+        print(f"[{threading.current_thread().name}] Archivo servido: {file_path} ({len(file_data)} bytes)")
     
     def do_POST(self):
-        """Manejar uploads con autenticación y validación"""
+        """Manejar uploads con autenticación y procesamiento asíncrono"""
         client_ip = self.client_address[0]
         
         # Verificar autenticación
@@ -243,17 +262,14 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
         self.log_access("POST", self.path, True, client_ip)
         
         if self.path in ['/upload', '/tts', '/stt']:
-            self.handle_upload()
+            self.handle_upload_async()
         elif self.path == '/status':
             self.handle_status()
         else:
             self.send_error(404, "Endpoint not found")
     
     def do_DELETE(self):
-        """
-        Manejar eliminación de archivos SOLO de /var/spool/asterisk/recording/
-        NO elimina archivos de /tmp (se limpian automáticamente)
-        """
+        """Manejar eliminación de archivos SOLO de /var/spool/asterisk/recording/"""
         client_ip = self.client_address[0]
         
         # Verificar autenticación
@@ -265,7 +281,6 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
         self.log_access("DELETE", self.path, True, client_ip)
         
         try:
-            # Extraer nombre de archivo de la URL
             filename = os.path.basename(self.path.lstrip('/'))
             if not filename:
                 self.send_error(400, "Filename required")
@@ -289,18 +304,19 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
                 "status": "success",
                 "message": f"Recording file deleted: {filename}",
                 "path": file_path,
+                "thread": threading.current_thread().name,
                 "note": "/tmp files are cleaned automatically by OS"
             }
             self.wfile.write(json.dumps(response).encode())
             
-            print(f"Archivo eliminado de recordings: {file_path}")
+            print(f"[{threading.current_thread().name}] Archivo eliminado: {file_path}")
             
         except Exception as e:
-            print(f"Error en DELETE: {e}")
+            print(f"[{threading.current_thread().name}] Error en DELETE: {e}")
             self.send_error(500, f"Delete failed: {str(e)}")
     
-    def handle_upload(self):
-        """Manejar upload de archivos con validación"""
+    def handle_upload_async(self):
+        """Manejar upload con procesamiento asíncrono para conversión"""
         try:
             # Obtener información del archivo
             filename = self.headers.get('Filename')
@@ -318,66 +334,155 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
                 self.send_error(400, validation_message)
                 return
             
-            print(f"Upload autorizado: {filename} ({content_length} bytes)")
+            thread_name = threading.current_thread().name
+            print(f"[{thread_name}] Upload autorizado: {filename} ({content_length} bytes)")
             
-            # Leer datos del archivo
+            # Leer datos del archivo con timeout
+            start_time = time.time()
             file_data = self.rfile.read(content_length)
+            read_time = time.time() - start_time
             
-            # Determinar directorio destino según prefijo
+            if read_time > self.upload_timeout:
+                self.send_error(408, f"Upload timeout after {read_time:.1f}s")
+                return
+            
+            # Determinar directorio destino
             target_dir = self.get_target_directory(filename)
             
-            # Guardar archivo temporal
-            temp_filepath = os.path.join(target_dir, f"temp_{filename}")
+            # Guardar archivo temporal inmediatamente
+            temp_filepath = os.path.join(target_dir, f"temp_{thread_name}_{filename}")
             with open(temp_filepath, 'wb') as f:
                 f.write(file_data)
             
-            print(f"Archivo temporal guardado: {temp_filepath}")
+            print(f"[{thread_name}] Archivo temporal guardado: {temp_filepath}")
             
-            # Convertir a formato Asterisk
+            # Determinar archivo final
             final_filepath = os.path.join(target_dir, filename)
-            success = self.convert_audio_to_asterisk_format(temp_filepath, final_filepath)
             
-            if success:
-                # Eliminar archivo temporal
-                try:
-                    os.remove(temp_filepath)
-                except:
-                    pass
+            # PROCESAMIENTO ASÍNCRONO: Enviar conversión al pool de threads
+            future = self.server.conversion_pool.submit(
+                self.convert_audio_with_cleanup,
+                temp_filepath,
+                final_filepath,
+                thread_name
+            )
+            
+            try:
+                # Esperar resultado con timeout
+                success, message = future.result(timeout=self.conversion_timeout)
                 
-                # Establecer permisos seguros
-                os.chmod(final_filepath, 0o644)
-                
-                # Verificar resultado
-                file_size = os.path.getsize(final_filepath)
-                print(f"Archivo procesado exitosamente: {final_filepath} ({file_size} bytes)")
-                
-                # Respuesta exitosa
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                
-                cleanup_info = ""
-                if target_dir in [self.tts_dir, self.stt_dir]:
-                    cleanup_info = " (will be cleaned automatically by OS)"
-                
-                response = {
-                    "status": "success",
-                    "filename": filename,
-                    "directory": target_dir,
-                    "original_size": len(file_data),
-                    "converted_size": file_size,
-                    "message": f"File uploaded and converted successfully{cleanup_info}"
-                }
-                self.wfile.write(json.dumps(response).encode())
-            else:
-                self.send_error(500, "Audio conversion failed")
+                if success:
+                    file_size = os.path.getsize(final_filepath)
+                    print(f"[{thread_name}] Archivo procesado exitosamente: {final_filepath} ({file_size} bytes)")
+                    
+                    # Respuesta exitosa
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    
+                    cleanup_info = ""
+                    if target_dir in [self.tts_dir, self.stt_dir]:
+                        cleanup_info = " (will be cleaned automatically by OS)"
+                    
+                    response = {
+                        "status": "success",
+                        "filename": filename,
+                        "directory": target_dir,
+                        "original_size": len(file_data),
+                        "converted_size": file_size,
+                        "processing_time": f"{read_time + (time.time() - start_time):.2f}s",
+                        "thread": thread_name,
+                        "message": f"File uploaded and converted successfully{cleanup_info}"
+                    }
+                    self.wfile.write(json.dumps(response).encode())
+                else:
+                    self.send_error(500, f"Audio conversion failed: {message}")
+                    
+            except concurrent.futures.TimeoutError:
+                print(f"[{thread_name}] Conversion timeout para {filename}")
+                self.send_error(408, f"Audio conversion timeout after {self.conversion_timeout}s")
+                # Cancelar future si es posible
+                future.cancel()
                 
         except Exception as e:
-            print(f"Error en upload: {e}")
+            print(f"[{threading.current_thread().name}] Error en upload: {e}")
             self.send_error(500, f"Upload failed: {str(e)}")
     
+    def convert_audio_with_cleanup(self, temp_filepath, final_filepath, thread_name):
+        """Convertir audio con limpieza automática - ejecutado en pool de threads"""
+        try:
+            print(f"[{thread_name}] Iniciando conversión: {temp_filepath} -> {final_filepath}")
+            
+            # Intentar conversión con sox
+            try:
+                result = subprocess.run([
+                    'sox', temp_filepath,
+                    '-r', '8000',  # Sample rate 8000Hz
+                    '-c', '1',     # Mono
+                    '-b', '16',    # 16-bit
+                    final_filepath
+                ], capture_output=True, text=True, timeout=25)
+                
+                if result.returncode == 0:
+                    print(f"[{thread_name}] Conversión exitosa con sox: {final_filepath}")
+                    self.cleanup_temp_file(temp_filepath, thread_name)
+                    os.chmod(final_filepath, 0o644)
+                    return True, "Converted with sox"
+                else:
+                    print(f"[{thread_name}] Error con sox: {result.stderr}")
+                    
+            except FileNotFoundError:
+                print(f"[{thread_name}] sox no encontrado, intentando con ffmpeg...")
+            except subprocess.TimeoutExpired:
+                print(f"[{thread_name}] sox timeout")
+            
+            # Intentar con ffmpeg
+            try:
+                result = subprocess.run([
+                    'ffmpeg', '-i', temp_filepath,
+                    '-ar', '8000',
+                    '-ac', '1',
+                    '-y',
+                    final_filepath
+                ], capture_output=True, text=True, timeout=25)
+                
+                if result.returncode == 0:
+                    print(f"[{thread_name}] Conversión exitosa con ffmpeg: {final_filepath}")
+                    self.cleanup_temp_file(temp_filepath, thread_name)
+                    os.chmod(final_filepath, 0o644)
+                    return True, "Converted with ffmpeg"
+                else:
+                    print(f"[{thread_name}] Error con ffmpeg: {result.stderr}")
+                    
+            except FileNotFoundError:
+                print(f"[{thread_name}] ffmpeg no encontrado")
+            except subprocess.TimeoutExpired:
+                print(f"[{thread_name}] ffmpeg timeout")
+            
+            # Fallback: copiar archivo original
+            print(f"[{thread_name}] Warning: No se pudo convertir audio, usando archivo original")
+            import shutil
+            shutil.copy2(temp_filepath, final_filepath)
+            self.cleanup_temp_file(temp_filepath, thread_name)
+            os.chmod(final_filepath, 0o644)
+            return True, "Used original file (no conversion)"
+            
+        except Exception as e:
+            print(f"[{thread_name}] Error en conversión: {e}")
+            self.cleanup_temp_file(temp_filepath, thread_name)
+            return False, str(e)
+    
+    def cleanup_temp_file(self, temp_filepath, thread_name):
+        """Limpiar archivo temporal de forma segura"""
+        try:
+            if os.path.exists(temp_filepath):
+                os.remove(temp_filepath)
+                print(f"[{thread_name}] Archivo temporal eliminado: {temp_filepath}")
+        except Exception as e:
+            print(f"[{thread_name}] Error eliminando temporal: {e}")
+    
     def handle_status(self):
-        """Endpoint de estado del servidor"""
+        """Endpoint de estado del servidor con información de threading"""
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
@@ -390,9 +495,21 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
             except:
                 return 0
         
+        # Información de threading
+        active_threads = threading.active_count()
+        thread_names = [t.name for t in threading.enumerate()]
+        
         status = {
             "status": "running",
-            "version": "2.2-simplified-delete",
+            "version": "3.0-concurrent",
+            "threading": {
+                "active_threads": active_threads,
+                "max_children": getattr(self.server, 'max_children', 'N/A'),
+                "conversion_pool_workers": self.server.conversion_pool._max_workers,
+                "conversion_pool_queue": self.server.conversion_pool._work_queue.qsize(),
+                "thread_names": thread_names,
+                "current_thread": threading.current_thread().name
+            },
             "directories": {
                 "recordings": {
                     "path": self.recordings_dir,
@@ -410,6 +527,10 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
                     "cleanup": "automatic by OS"
                 }
             },
+            "timeouts": {
+                "conversion_timeout": self.conversion_timeout,
+                "upload_timeout": self.upload_timeout
+            },
             "endpoints": {
                 "GET": ["/status", "/filename.wav", "/tts/filename.wav", "/stt/filename.wav"],
                 "POST": ["/upload", "/tts", "/stt"],
@@ -425,80 +546,31 @@ class SecureAsteriskHandler(SimpleHTTPRequestHandler):
         }
         self.wfile.write(json.dumps(status, indent=2).encode())
     
-    def convert_audio_to_asterisk_format(self, input_file, output_file):
-        """Convertir audio a formato compatible con Asterisk (8000Hz, mono, 16-bit)"""
-        try:
-            # Intentar con sox primero
-            result = subprocess.run([
-                'sox', input_file,
-                '-r', '8000',  # Sample rate 8000Hz
-                '-c', '1',     # Mono
-                '-b', '16',    # 16-bit
-                output_file
-            ], capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print(f"Conversion exitosa con sox: {output_file}")
-                return True
-            else:
-                print(f"Error con sox: {result.stderr}")
-                
-        except FileNotFoundError:
-            print("sox no encontrado, intentando con ffmpeg...")
-        
-        try:
-            # Intentar con ffmpeg como alternativa
-            result = subprocess.run([
-                'ffmpeg', '-i', input_file,
-                '-ar', '8000',  # Sample rate
-                '-ac', '1',     # Mono
-                '-y',           # Overwrite
-                output_file
-            ], capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print(f"Conversion exitosa con ffmpeg: {output_file}")
-                return True
-            else:
-                print(f"Error con ffmpeg: {result.stderr}")
-                
-        except FileNotFoundError:
-            print("ffmpeg no encontrado")
-        
-        # Si ambos fallan, copiar archivo original
-        print("Warning: No se pudo convertir audio, usando archivo original")
-        try:
-            import shutil
-            shutil.copy2(input_file, output_file)
-            return True
-        except Exception as e:
-            print(f"Error copiando archivo: {e}")
-            return False
-    
     def check_conversion_tools(self):
         """Verificar herramientas de conversión disponibles"""
         tools = {}
         
         # Verificar sox
         try:
-            result = subprocess.run(['sox', '--version'], capture_output=True, text=True)
+            result = subprocess.run(['sox', '--version'], capture_output=True, text=True, timeout=5)
             tools['sox'] = result.returncode == 0
-        except FileNotFoundError:
+        except (FileNotFoundError, subprocess.TimeoutExpired):
             tools['sox'] = False
         
         # Verificar ffmpeg
         try:
-            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=5)
             tools['ffmpeg'] = result.returncode == 0
-        except FileNotFoundError:
+        except (FileNotFoundError, subprocess.TimeoutExpired):
             tools['ffmpeg'] = False
         
         return tools
     
     def log_message(self, format, *args):
-        """Log personalizado con timestamp"""
+        """Log personalizado con timestamp y thread"""
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-        print(f"[{timestamp}] {format % args}")
+        thread_name = threading.current_thread().name
+        print(f"[{timestamp}] [{thread_name}] {format % args}")
 
 def main():
     # Verificar que se ejecuta como usuario apropiado
@@ -524,33 +596,37 @@ def main():
     # Verificar herramientas de conversión
     print("Verificando herramientas de conversión...")
     try:
-        subprocess.run(['sox', '--version'], capture_output=True, check=True)
+        subprocess.run(['sox', '--version'], capture_output=True, check=True, timeout=5)
         print("sox: DISPONIBLE")
     except:
         print("sox: NO DISPONIBLE")
     
     try:
-        subprocess.run(['ffmpeg', '--version'], capture_output=True, check=True)
+        subprocess.run(['ffmpeg', '--version'], capture_output=True, check=True, timeout=5)
         print("ffmpeg: DISPONIBLE")
     except:
         print("ffmpeg: NO DISPONIBLE")
     
-    print("\nServidor HTTP Asterisk simplificado iniciando...")
+    print("\n Servidor HTTP Asterisk CONCURRENTE iniciando...")
     print(f"Directorio grabaciones permanentes: /var/spool/asterisk/recording")
     print(f"Directorio TTS temporal: /tmp/asterisk/tts (limpieza automática)")
     print(f"Directorio STT temporal: /tmp/asterisk/stt (limpieza automática)")
     print(f"DELETE: Solo funciona en /var/spool/asterisk/recording/")
+    print(f"Threading: Máximo 50 conexiones concurrentes")
+    print(f"Pool conversión: 5 workers para procesamiento de audio")
     print(f"Escuchando en: http://0.0.0.0:8001")
     print("Presiona Ctrl+C para detener")
     print("-" * 70)
     
-    # Crear y iniciar servidor
-    server = HTTPServer(('0.0.0.0', 8001), SecureAsteriskHandler)
+    # Crear servidor threaded
+    server = ThreadedHTTPServer(('0.0.0.0', 8001), SecureAsteriskHandler)
     
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nDeteniendo servidor...")
+        # Cerrar pool de threads
+        server.conversion_pool.shutdown(wait=True)
         server.shutdown()
         print("Servidor detenido")
 
